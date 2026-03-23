@@ -78,7 +78,7 @@ class Config:
                 )
             elif self.openai_api_key:
                 self.primary_model = ModelConfig(
-                    provider="openai", model_id="gpt-4o",
+                    provider="openai", model_id="gpt-5.1",
                     max_tokens=4096, temperature=0.7,
                 )
             elif self.google_ai_api_key:
@@ -91,7 +91,7 @@ class Config:
             if self.anthropic_api_key:
                 self.models.append(ModelConfig(provider="anthropic", model_id="claude-sonnet-4-6"))
             if self.openai_api_key:
-                self.models.append(ModelConfig(provider="openai", model_id="gpt-4o"))
+                self.models.append(ModelConfig(provider="openai", model_id="gpt-5.1"))
             if self.google_ai_api_key:
                 self.models.append(ModelConfig(provider="google", model_id="gemini-3.1"))
 
