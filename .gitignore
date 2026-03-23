@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+.pytest_cache/
+data/predictions/
+data/calibration/
+data/platform_signals/
+data/lessons/
