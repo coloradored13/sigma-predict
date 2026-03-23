@@ -73,6 +73,8 @@ class SearchModule:
         self._api_key = config.tavily_api_key
         self._search_depth = config.search.search_depth
         self._default_max_results = config.search.max_results
+        if not self._api_key:
+            logger.warning("No TAVILY_API_KEY — search will return empty results (LLM knowledge only)")
 
     # ------------------------------------------------------------------
     # Public API
@@ -80,6 +82,9 @@ class SearchModule:
 
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         """Run a single search query and return parsed results."""
+        if not self._api_key:
+            return []
+
         payload = {
             "api_key": self._api_key,
             "query": query,

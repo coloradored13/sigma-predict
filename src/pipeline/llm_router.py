@@ -67,13 +67,16 @@ class LLMRouter:
     def __init__(self, config: Config):
         self.config = config
 
-        # Local Anthropic client
-        self._anthropic = AnthropicClient(
-            model=config.primary_model.model_id,
-            api_key=config.anthropic_api_key,
-        )
+        # Local Anthropic client (only if key available)
+        self._anthropic = None
+        if config.anthropic_api_key:
+            self._anthropic = AnthropicClient(
+                model="claude-sonnet-4-6",
+                api_key=config.anthropic_api_key,
+            )
+            logger.info("Anthropic client available")
 
-        # External clients from sigma-verify (optional)
+        # External clients from sigma-verify
         self._openai = None
         self._gemini = None
 
@@ -99,6 +102,12 @@ class LLMRouter:
         except ImportError:
             logger.warning("sigma-verify not installed — Gemini client unavailable")
 
+        logger.info(
+            "LLMRouter ready: primary=%s, providers=%s",
+            config.primary_model.provider if config.primary_model else "none",
+            self.available_providers(),
+        )
+
     def call(
         self,
         provider: str,
@@ -113,7 +122,8 @@ class LLMRouter:
         Returns (response_text, tokens_in, tokens_out).
         """
         if provider == "anthropic":
-            # Use specified model, not just the default
+            if self._anthropic is None:
+                raise ValueError("Anthropic client not available (no API key)")
             old_model = self._anthropic.model
             self._anthropic.model = model
             try:
@@ -244,7 +254,7 @@ class LLMRouter:
     def available_providers(self) -> list[str]:
         """Return list of provider names with valid API keys."""
         providers = []
-        if self._anthropic.available:
+        if self._anthropic is not None and self._anthropic.available:
             providers.append("anthropic")
         if self._openai is not None:
             providers.append("openai")
@@ -296,12 +306,24 @@ class LLMRouter:
         return None
 
     def _external_clients(self) -> list:
-        """Return list of all available external clients."""
+        """Return list of clients available for verification.
+
+        Excludes the primary provider — you shouldn't verify against the
+        same model that generated the forecast.
+        """
+        primary = self.config.primary_model.provider if self.config.primary_model else None
         clients = []
-        if self._openai is not None:
+        if self._openai is not None and primary != "openai":
             clients.append(self._openai)
-        if self._gemini is not None:
+        if self._gemini is not None and primary != "google":
             clients.append(self._gemini)
+        # If the only available providers are the primary, include them anyway
+        # (some verification is better than none)
+        if not clients:
+            if self._openai is not None:
+                clients.append(self._openai)
+            if self._gemini is not None:
+                clients.append(self._gemini)
         return clients
 
     def _provider_name(self, client: Any) -> str:
