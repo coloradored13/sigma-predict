@@ -15,6 +15,7 @@ Coordinates the full prediction pipeline:
 from __future__ import annotations
 
 import logging
+import queue
 import time
 from datetime import datetime, timezone
 
@@ -28,16 +29,18 @@ from src.models import (
     PlatformSignals,
     PredictionRecord,
     SearchPersona,
+    StageVerification,
     Submission,
     VerificationReport,
 )
-from src.pipeline.aggregator import aggregate_runs
-from src.pipeline.base_rate import estimate_base_rate
+from src.pipeline.aggregator import aggregate_runs, get_aggregate_run
+from src.pipeline.base_rate import estimate_base_rate, search_augmented_base_rate
 from src.pipeline.calibration import calibrate, load_platt_params
 from src.pipeline.decomposer import decompose_question
 from src.pipeline.deliberation import deliberate, should_deliberate
 from src.pipeline.forecaster import run_forecast
 from src.pipeline.llm_router import LLMRouter
+from src.pipeline.search import SearchModule
 from src.pipeline.verification import (
     challenge_forecast,
     should_verify_run,
@@ -62,26 +65,34 @@ class Orchestrator:
         self.store = RegistryStore(config.registry_path)
         self.query = RegistryQuery(self.store)
 
-    def predict(
+    def predict_until_review(
         self,
         question: PlatformQuestion,
         platform_client: PlatformClient,
         num_runs: int = 1,
         personas: list[SearchPersona] | None = None,
-        auto_submit: bool = False,
+        progress_queue: queue.Queue | None = None,
     ) -> PredictionRecord:
-        """Run the full prediction pipeline on a question.
+        """Run the prediction pipeline up to (but not including) submission.
+
+        Stops after calibration and platform signal collection, leaving the
+        record ready for human review. Does NOT save to the registry.
 
         Args:
             question: The question to predict on
             platform_client: Client for the question's platform
             num_runs: Number of independent estimation runs
             personas: Search personas to use (one per run)
-            auto_submit: If True, skip human review (for testing)
+            progress_queue: Optional queue.Queue to receive progress strings.
+                A None sentinel is put on the queue when the pipeline completes.
 
         Returns:
-            Complete PredictionRecord
+            PredictionRecord ready for human review (not yet saved)
         """
+        def _progress(msg: str) -> None:
+            if progress_queue is not None:
+                progress_queue.put(msg)
+
         pipeline_start = time.time()
         total_cost = CostTracking()
 
@@ -89,11 +100,14 @@ class Orchestrator:
             if num_runs == 1:
                 personas = [SearchPersona.NEWS]
             else:
-                # Rotate through personas
                 all_personas = list(SearchPersona)
                 personas = [all_personas[i % len(all_personas)] for i in range(num_runs)]
 
         logger.info("Starting prediction pipeline for: %s", question.title)
+        _progress(f"Starting pipeline for: {question.title}")
+
+        # Accumulate pipeline warnings for downstream injection
+        pipeline_warnings: list[str] = []
 
         # Initialize record
         record = PredictionRecord(
@@ -113,15 +127,18 @@ class Orchestrator:
             providers_available=self.router.available_providers(),
         )
         if v_config.enabled and not self.router.verification_available():
-            logger.warning(
-                "Verification enabled in config but no external providers available"
-            )
+            msg = "Verification enabled in config but no external providers available"
+            logger.warning(msg)
+            pipeline_warnings.append(msg)
 
         question_text_full = question.title + "\n" + question.description
 
         # Step 1: Decompose question
         logger.info("Step 1/7: Decomposing question...")
-        decomposition = decompose_question(question, self.config, router=self.router)
+        _progress("Step 1/7: Decomposing question...")
+        decomposition = decompose_question(
+            question, self.config, router=self.router,
+        )
         record.decomposition = decomposition
 
         # Step 1b: Verify actors if enabled and L2/3 present
@@ -139,6 +156,7 @@ class Orchestrator:
 
         # Step 2: Estimate base rate (isolated — BEFORE search)
         logger.info("Step 2/7: Estimating base rate (isolated)...")
+        _progress("Step 2/7: Estimating base rate...")
         base_rate, ref_class, base_source = estimate_base_rate(
             question_text=question_text_full,
             sub_questions=decomposition.sub_questions,
@@ -149,6 +167,21 @@ class Orchestrator:
         record.decomposition.base_rate = base_rate
         record.decomposition.reference_class = ref_class
         record.decomposition.base_rate_source = base_source
+
+        # Step 2c: Search-augmented base rate (statistical firewall — AFTER isolated estimate)
+        search_module_for_base = SearchModule(self.config)
+        augmented_rate, citation_note = search_augmented_base_rate(
+            base_rate=base_rate,
+            reference_class=ref_class,
+            search_module=search_module_for_base,
+            router=self.router,
+            config=self.config,
+        )
+        if citation_note:
+            base_rate = augmented_rate
+            record.decomposition.base_rate = base_rate
+            record.decomposition.base_rate_source = citation_note
+            logger.info("Base rate augmented by search: %.3f", base_rate)
 
         # Step 2b: Verify base rate if enabled
         if v_enabled and v_config.verify_base_rate:
@@ -161,7 +194,7 @@ class Orchestrator:
 
         # Step 3: Run forecaster(s)
         logger.info("Step 3/7: Running %d forecast run(s)...", num_runs)
-        from src.pipeline.search import SearchModule
+        _progress(f"Step 3/7: Running {num_runs} forecast run(s)...")
         search_module = SearchModule(self.config)
 
         for i, persona in enumerate(personas[:num_runs]):
@@ -169,8 +202,8 @@ class Orchestrator:
                        i + 1, num_runs,
                        self.config.primary_model.model_id,
                        persona.value)
+            _progress(f"  Run {i + 1}/{num_runs}: persona={persona.value}")
 
-            # Independent search for this run
             search_results = search_module.search_with_persona(
                 question.title + " " + question.description[:200],
                 persona,
@@ -200,56 +233,72 @@ class Orchestrator:
                     )
                     record.verification.stages.append(run_sv)
 
-        # Step 3c: Challenge forecast via pre-mortem if enabled
-        if v_enabled and v_config.challenge_pre_mortem and record.runs:
-            logger.info("  Step 3c: Challenging forecast (pre-mortem)...")
-            # Challenge the last run as representative of the aggregate
-            challenge_entry = challenge_forecast(
-                record.runs[-1], question_text_full,
-                self.router, self.config,
-            )
-            if challenge_entry is not None:
-                # Attach challenge to a StageVerification
-                from src.models import StageVerification
-                challenge_sv = StageVerification(
-                    stage="challenge_pre_mortem",
-                    finding_summary=f"Challenge of forecast P={record.runs[-1].probability:.3f}",
-                    challenges=[challenge_entry],
-                    agreement="no_data",  # challenges don't have agreement
-                )
-                record.verification.stages.append(challenge_sv)
-
-        # Step 4: Aggregate
+        # Step 4: Aggregate (before challenge so challenge targets the aggregate)
         logger.info("Step 4/7: Aggregating estimates...")
+        _progress("Step 4/7: Aggregating estimates...")
+        n_providers = len(set(r.provider for r in record.runs if hasattr(r, "provider")))
+        n_distinct_providers = max(1, n_providers)
         aggregation = aggregate_runs(
             record.runs,
             method=self.config.aggregation.method,
             trim_fraction=self.config.aggregation.trim_fraction,
             extremization_factor=self.config.aggregation.extremization_factor,
+            n_distinct_providers=n_distinct_providers,
         )
         record.aggregation = aggregation
 
+        # Step 3c: Challenge forecast via pre-mortem if enabled
+        challenge_entry_for_deliberation = None
+        if v_enabled and v_config.challenge_pre_mortem and record.runs:
+            logger.info("  Step 3c: Challenging forecast (pre-mortem)...")
+            aggregate_run = get_aggregate_run(record.runs, record.aggregation)
+            challenge_entry_for_deliberation = challenge_forecast(
+                aggregate_run, question_text_full,
+                self.router, self.config,
+            )
+            if challenge_entry_for_deliberation is not None:
+                challenge_sv = StageVerification(
+                    stage="challenge_pre_mortem",
+                    finding_summary=(
+                        f"Challenge of aggregate forecast P={aggregate_run.probability:.3f}"
+                    ),
+                    challenges=[challenge_entry_for_deliberation],
+                    agreement="no_data",
+                )
+                record.verification.stages.append(challenge_sv)
+
         # Check for deliberation (Phase 3)
-        if should_deliberate(aggregation, self.config) and num_runs > 1:
+        pre_mortem_delta = max(
+            (abs(r.pre_mortem_delta) for r in record.runs), default=0.0
+        )
+        if should_deliberate(
+            aggregation,
+            self.config,
+            challenge_entry=challenge_entry_for_deliberation,
+            pre_mortem_delta=pre_mortem_delta,
+        ) and num_runs > 1:
             logger.info("Deliberation triggered (stdev=%.3f)", aggregation.stdev)
             record.runs, record.aggregation = deliberate(
-                record.runs, aggregation, self.config
+                record.runs, aggregation, self.config, router=self.router,
             )
             record.aggregation.deliberation_triggered = True
+            aggregation = record.aggregation
 
         # Step 5: Calibrate
         logger.info("Step 5/7: Calibrating...")
+        _progress("Step 5/7: Calibrating...")
         n_resolved = self.query.count_resolved()
         platt_params = load_platt_params(self.config)
+        pairs = self.query.get_calibration_pairs()
 
         cal_prob, platt_dict = calibrate(
             probability=aggregation.raw_aggregate,
             config=self.config,
             platt_params=platt_params,
             n_resolved=n_resolved,
+            isotonic_data=pairs,
         )
 
-        # Compute confidence interval from stdev
         stdev = aggregation.stdev
         ci_low = max(0.01, cal_prob - 1.96 * stdev) if stdev > 0 else max(0.01, cal_prob - 0.05)
         ci_high = min(0.99, cal_prob + 1.96 * stdev) if stdev > 0 else min(0.99, cal_prob + 0.05)
@@ -263,31 +312,68 @@ class Orchestrator:
         # Collect platform signals
         record.platform_signals = self._collect_platform_signals(question, platform_client)
 
-        # Step 6: Human review
-        logger.info("Step 6/7: Presenting for human review...")
+        # Record cost (latency through pipeline, not including review/submit)
         total_cost.latency_seconds = time.time() - pipeline_start
         record.cost = total_cost
 
-        if auto_submit:
-            record.human_review = HumanReview(reviewed=False)
-            final_prob = cal_prob
+        logger.info(
+            "Pipeline complete (pre-review): id=%s prob=%.3f cost=$%.4f",
+            record.prediction_id,
+            cal_prob,
+            total_cost.total_cost_usd,
+        )
+        _progress(f"Pipeline complete. Calibrated probability: {cal_prob:.3f}")
+
+        if progress_queue is not None:
+            progress_queue.put(None)  # sentinel: pipeline done
+
+        return record
+
+    def submit_after_review(
+        self,
+        record: PredictionRecord,
+        question: PlatformQuestion,
+        platform_client: PlatformClient,
+        human_review: HumanReview | None = None,
+    ) -> PredictionRecord:
+        """Apply human review, submit to platform, and save to registry.
+
+        Called after predict_until_review() once the human has reviewed the
+        prediction. Handles rejection, probability adjustment, platform
+        submission, and registry persistence.
+
+        Args:
+            record: PredictionRecord from predict_until_review()
+            question: The original platform question
+            platform_client: Client for the question's platform
+            human_review: HumanReview to apply. If None, uses present_for_review()
+                to prompt interactively.
+
+        Returns:
+            Updated PredictionRecord (saved to registry)
+        """
+        cal_prob = record.calibration.calibrated_probability
+
+        if human_review is not None:
+            review = human_review
         else:
+            logger.info("Step 6/7: Presenting for human review...")
             review = present_for_review(record, question)
-            record.human_review = review
+        record.human_review = review
 
-            if review.human_reasoning and review.human_reasoning.startswith("REJECTED"):
-                logger.info("Prediction rejected by human reviewer")
-                self.store.save(record)
-                return record
+        if review.human_reasoning and review.human_reasoning.startswith("REJECTED"):
+            logger.info("Prediction rejected by human reviewer")
+            self.store.save(record)
+            return record
 
-            if review.human_adjustment is not None:
-                final_prob = cal_prob + review.human_adjustment
-                final_prob = max(0.01, min(0.99, final_prob))
-            else:
-                final_prob = cal_prob
+        if review.human_adjustment is not None:
+            final_prob = cal_prob + review.human_adjustment
+            final_prob = max(0.01, min(0.99, final_prob))
+        else:
+            final_prob = cal_prob
 
-        # Submit
-        logger.info("Submitting prediction: %.3f to %s", final_prob, question.platform.value)
+        # Submit to platform
+        logger.info("Step 7/7: Submitting prediction: %.3f to %s", final_prob, question.platform.value)
         try:
             success = platform_client.submit_prediction(
                 question.question_id, final_prob
@@ -313,10 +399,58 @@ class Orchestrator:
         self.store.save(record)
         logger.info(
             "Prediction logged: id=%s prob=%.3f cost=$%.4f",
-            record.prediction_id, final_prob, total_cost.total_cost_usd,
+            record.prediction_id,
+            final_prob,
+            record.cost.total_cost_usd,
         )
 
         return record
+
+    def predict(
+        self,
+        question: PlatformQuestion,
+        platform_client: PlatformClient,
+        num_runs: int = 1,
+        personas: list[SearchPersona] | None = None,
+        auto_submit: bool = False,
+    ) -> PredictionRecord:
+        """Run the full prediction pipeline on a question.
+
+        Convenience wrapper combining predict_until_review() and
+        submit_after_review(). Use predict_until_review() + submit_after_review()
+        directly when you need to show results before submission (e.g. Streamlit UI).
+
+        Args:
+            question: The question to predict on
+            platform_client: Client for the question's platform
+            num_runs: Number of independent estimation runs
+            personas: Search personas to use (one per run)
+            auto_submit: If True, skip interactive human review
+
+        Returns:
+            Complete PredictionRecord
+        """
+        record = self.predict_until_review(
+            question=question,
+            platform_client=platform_client,
+            num_runs=num_runs,
+            personas=personas,
+        )
+
+        if auto_submit:
+            review = HumanReview(reviewed=False)
+            return self.submit_after_review(
+                record=record,
+                question=question,
+                platform_client=platform_client,
+                human_review=review,
+            )
+
+        return self.submit_after_review(
+            record=record,
+            question=question,
+            platform_client=platform_client,
+        )
 
     def _infer_domain(self, question: PlatformQuestion) -> str:
         """Infer the domain from question tags or content."""

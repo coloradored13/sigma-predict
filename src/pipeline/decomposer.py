@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from src.config import Config
 from src.models import (
@@ -17,18 +16,16 @@ from src.models import (
     PeripheralCategory,
     PlatformQuestion,
 )
+from src.pipeline.utils import _extract_json, _load_prompt
 
 logger = logging.getLogger(__name__)
 
 
-def _load_prompt(config: Config, filename: str) -> str:
-    path = os.path.join(config.prompts_dir, filename)
-    with open(path) as f:
-        return f.read()
-
-
 def decompose_question(
-    question: PlatformQuestion, config: Config, router=None
+    question: PlatformQuestion,
+    config: Config,
+    router=None,
+    warnings_out: list[str] | None = None,
 ) -> Decomposition:
     """Decompose a question into sub-questions and analyze actor motivations.
 
@@ -62,7 +59,7 @@ def decompose_question(
 """
 
     raw, _, _ = router.call(
-        "anthropic",
+        config.primary_model.provider,
         config.primary_model.model_id,
         system_prompt,
         user_content,
@@ -78,6 +75,8 @@ def decompose_question(
     except json.JSONDecodeError:
         logger.warning("Failed to parse decomposition JSON, using defaults")
         logger.debug("Raw response: %s", raw)
+        if warnings_out is not None:
+            warnings_out.append("decomposition_parse_failure")
         return Decomposition()
 
     # Build Decomposition from parsed data
@@ -146,26 +145,3 @@ def decompose_question(
     )
 
     return decomposition
-
-
-def _extract_json(text: str) -> str:
-    """Extract JSON from text that may contain markdown code blocks."""
-    # Try to find JSON in code blocks first
-    if "```json" in text:
-        start = text.index("```json") + 7
-        end = text.index("```", start)
-        return text[start:end].strip()
-    if "```" in text:
-        start = text.index("```") + 3
-        end = text.index("```", start)
-        return text[start:end].strip()
-    # Try the raw text as JSON
-    text = text.strip()
-    if text.startswith("{"):
-        return text
-    # Last resort: find first { to last }
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        return text[start:end + 1]
-    return text

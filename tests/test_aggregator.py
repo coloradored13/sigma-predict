@@ -74,6 +74,52 @@ class TestAggregateRuns:
         assert abs(result.raw_aggregate - 0.5) < 0.01
 
 
+class TestNDistinctProvidersGate:
+    def test_single_provider_no_extremization(self):
+        # With n_distinct_providers=1, extremized_trimmed_mean should NOT extremize
+        # Use values clearly above 0.5 so trimmed_mean is > 0.5
+        runs = [_make_run(p) for p in [0.65, 0.67, 0.63, 0.66, 0.64]]
+        result_single = aggregate_runs(
+            runs, method="extremized_trimmed_mean", n_distinct_providers=1
+        )
+        result_multi = aggregate_runs(
+            runs, method="extremized_trimmed_mean", n_distinct_providers=2
+        )
+        # Single provider: raw_aggregate = trimmed_mean (no extremization)
+        # Multi provider: raw_aggregate is extremized (pushed further from 0.5)
+        assert result_multi.raw_aggregate > result_single.raw_aggregate
+
+    def test_two_providers_extremizes(self):
+        runs = [_make_run(p) for p in [0.6, 0.65, 0.62, 0.58, 0.64]]
+        result = aggregate_runs(
+            runs, method="extremized_trimmed_mean", n_distinct_providers=2
+        )
+        mean_val = float(sum([0.6, 0.65, 0.62, 0.58, 0.64]) / 5)
+        # With extremization, aggregate should be pushed further from 0.5
+        assert result.raw_aggregate > mean_val
+
+    def test_single_provider_aggregate_equals_trimmed_mean(self):
+        # n=5, trim_fraction=0.1 → trim_count=max(1,0)=1 → trimmed 3 middle values
+        runs = [_make_run(p) for p in [0.5, 0.6, 0.7, 0.8, 0.9]]
+        result = aggregate_runs(
+            runs, method="extremized_trimmed_mean",
+            trim_fraction=0.1, n_distinct_providers=1
+        )
+        # trimmed: [0.6, 0.7, 0.8] → mean = 0.7
+        assert result.raw_aggregate == pytest.approx(0.7, abs=0.01)
+
+    def test_default_n_distinct_providers_is_one(self):
+        # Default (n_distinct_providers=1) should NOT extremize
+        runs = [_make_run(p) for p in [0.65, 0.67, 0.63, 0.66, 0.64]]
+        result_default = aggregate_runs(runs, method="extremized_trimmed_mean")
+        result_explicit_1 = aggregate_runs(
+            runs, method="extremized_trimmed_mean", n_distinct_providers=1
+        )
+        assert result_default.raw_aggregate == pytest.approx(
+            result_explicit_1.raw_aggregate, abs=1e-9
+        )
+
+
 class TestExtremize:
     def test_identity_at_center(self):
         # At p=0.5, extremization should have no effect

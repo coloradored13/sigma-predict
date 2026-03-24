@@ -6,7 +6,6 @@ Usage:
 
 from __future__ import annotations
 
-import math
 import sys
 
 import click
@@ -16,12 +15,9 @@ from rich.table import Table
 from src.config import Config
 from src.registry.store import RegistryStore
 from src.registry.query import RegistryQuery
+from src.scoring import brier_score
 
 console = Console()
-
-
-def brier_score(predicted: float, actual: float) -> float:
-    return (predicted - actual) ** 2
 
 
 @click.command()

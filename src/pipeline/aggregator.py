@@ -19,6 +19,7 @@ def aggregate_runs(
     method: str = "extremized_trimmed_mean",
     trim_fraction: float = 0.1,
     extremization_factor: float = 1.5,
+    n_distinct_providers: int = 1,
 ) -> Aggregation:
     """Aggregate multiple run estimates into a single probability.
 
@@ -29,6 +30,8 @@ def aggregate_runs(
         extremization_factor: Factor to push estimate away from 0.5
             Values > 1.0 push away from 0.5 (extremize)
             Values < 1.0 pull toward 0.5 (moderate)
+        n_distinct_providers: Number of distinct model providers in runs.
+            Extremization is only applied when this is >= 2.
 
     Returns:
         Aggregation with computed statistics
@@ -63,10 +66,13 @@ def aggregate_runs(
     else:
         trimmed_mean = raw_mean
 
-    # Extremized mean: push the trimmed mean away from 0.5
+    # Extremized mean: push the trimmed mean away from 0.5 (only with multiple providers)
     # Using the log-odds transformation
     if method == "extremized_trimmed_mean":
-        raw_aggregate = _extremize(trimmed_mean, extremization_factor)
+        if n_distinct_providers >= 2:
+            raw_aggregate = _extremize(trimmed_mean, extremization_factor)
+        else:
+            raw_aggregate = trimmed_mean
     elif method == "trimmed_mean":
         raw_aggregate = trimmed_mean
     elif method == "median":
@@ -74,7 +80,10 @@ def aggregate_runs(
     elif method == "mean":
         raw_aggregate = raw_mean
     else:
-        raw_aggregate = _extremize(trimmed_mean, extremization_factor)
+        if n_distinct_providers >= 2:
+            raw_aggregate = _extremize(trimmed_mean, extremization_factor)
+        else:
+            raw_aggregate = trimmed_mean
 
     # Clamp to valid probability range
     raw_aggregate = max(0.01, min(0.99, raw_aggregate))
@@ -146,3 +155,59 @@ def _estimate_effective_n(probabilities: np.ndarray) -> int:
         effective_n = 1
 
     return max(1, min(n, effective_n))
+
+
+def get_aggregate_run(runs: list[RunResult], aggregation: Aggregation) -> RunResult:
+    """Construct a synthetic RunResult representing the aggregate of all runs.
+
+    Used by challenge_forecast to challenge the aggregate probability rather
+    than the last individual run. Summarizes reasoning from all runs.
+
+    Args:
+        runs: All completed forecast runs
+        aggregation: The computed aggregation from aggregate_runs()
+
+    Returns:
+        Synthetic RunResult with aggregate probability and summarized reasoning
+    """
+    if not runs:
+        return RunResult(
+            model="aggregate",
+            probability=aggregation.raw_aggregate,
+            reasoning_chain="No runs to aggregate.",
+        )
+
+    # Summarize reasoning chains from all runs
+    reasoning_parts = []
+    for i, run in enumerate(runs):
+        reasoning_parts.append(
+            f"Run {i + 1} (model={run.model}, p={run.probability:.3f}): "
+            f"{run.reasoning_chain[:200]}"
+        )
+    combined_reasoning = "\n\n".join(reasoning_parts)
+
+    # Use mean of base rates and inside-view adjustments
+    mean_base_rate = float(np.mean([r.base_rate_used for r in runs]))
+    mean_adjustment = float(np.mean([r.inside_view_adjustment for r in runs]))
+
+    # Represent the worst pre-mortem outcome across runs
+    max_pre_mortem_delta = max(
+        (abs(r.pre_mortem_delta) for r in runs), default=0.0
+    )
+    worst_run = max(runs, key=lambda r: abs(r.pre_mortem_delta), default=runs[0])
+
+    return RunResult(
+        model="aggregate",
+        search_persona="aggregate",
+        base_rate_used=round(mean_base_rate, 4),
+        inside_view_adjustment=round(mean_adjustment, 4),
+        adjustment_reasoning=f"Aggregate of {len(runs)} run(s)",
+        pre_mortem_scenario=worst_run.pre_mortem_scenario,
+        pre_mortem_changed_estimate=any(r.pre_mortem_changed_estimate for r in runs),
+        pre_mortem_delta=round(max_pre_mortem_delta, 4),
+        probability=aggregation.raw_aggregate,
+        confidence_self_score=int(
+            round(float(np.mean([r.confidence_self_score for r in runs])))
+        ),
+        reasoning_chain=combined_reasoning,
+    )

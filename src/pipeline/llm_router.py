@@ -37,13 +37,15 @@ class AnthropicClient:
         user_content: str,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        model: str | None = None,
     ) -> tuple[str, int, int]:
         """General-purpose LLM call. Returns (text, tokens_in, tokens_out)."""
         import anthropic
 
+        resolved_model = model if model is not None else self.model
         client = anthropic.Anthropic(api_key=self._api_key)
         response = client.messages.create(
-            model=self.model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system,
@@ -124,12 +126,7 @@ class LLMRouter:
         if provider == "anthropic":
             if self._anthropic is None:
                 raise ValueError("Anthropic client not available (no API key)")
-            old_model = self._anthropic.model
-            self._anthropic.model = model
-            try:
-                return self._anthropic.call(system, user, temperature, max_tokens)
-            finally:
-                self._anthropic.model = old_model
+            return self._anthropic.call(system, user, temperature, max_tokens, model=model)
 
         elif provider == "openai":
             if self._openai is None:

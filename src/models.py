@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -55,7 +56,7 @@ class Actor(BaseModel):
     level: ActorLevel
     level_label: str
     motivation: str
-    influence_estimate: str  # low | medium | high
+    influence_estimate: Literal["low", "medium", "high"] = "low"
     observable_indicators: list[str] = Field(default_factory=list)
     implication_for_estimate: str = ""
 
@@ -90,6 +91,7 @@ class Decomposition(BaseModel):
 class RunResult(BaseModel):
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     model: str = ""
+    provider: str = ""
     search_persona: str = SearchPersona.NEWS.value
     search_queries: list[str] = Field(default_factory=list)
     sources_cited: list[str] = Field(default_factory=list)
@@ -104,6 +106,8 @@ class RunResult(BaseModel):
     probability: float = 0.5
     confidence_self_score: int = 5
     reasoning_chain: str = ""
+    parse_failed: bool = False
+    falsification_anchors: list[str] = Field(default_factory=list)
 
 
 class Aggregation(BaseModel):
@@ -123,13 +127,7 @@ class CalibrationData(BaseModel):
 
 
 class PlatformSignals(BaseModel):
-    prices_at_prediction_time: dict[str, float | None] = Field(
-        default_factory=lambda: {
-            "metaculus_community": None,
-            "polymarket": None,
-            "kalshi": None,
-        }
-    )
+    prices_at_prediction_time: dict[str, float | None] = Field(default_factory=dict)
     cross_platform_divergence: float | None = None
     anomaly_detected: bool = False
     anomaly_details: str | None = None
@@ -140,6 +138,7 @@ class HumanReview(BaseModel):
     human_adjustment: float | None = None
     human_reasoning: str | None = None
     flags_raised: list[str] = Field(default_factory=list)
+    actor_analysis_consulted: bool = False
 
 
 class Submission(BaseModel):
@@ -161,8 +160,8 @@ class Resolution(BaseModel):
 class VerificationEntry(BaseModel):
     provider: str = ""
     model: str = ""
-    assessment: str = ""  # agree | disagree | partial | uncertain
-    confidence: str = ""  # high | medium | low
+    assessment: Literal["agree", "disagree", "partial", "uncertain"] = "uncertain"
+    confidence: Literal["high", "medium", "low"] = "medium"
     reasoning: str = ""
     counter_evidence: str = ""
     status: str = "success"
@@ -175,7 +174,7 @@ class ChallengeEntry(BaseModel):
     counter_argument: str = ""
     logical_gaps: str = ""
     evidence_needed: str = ""
-    vulnerability: str = ""  # high | medium | low
+    vulnerability: Literal["high", "medium", "low"] = "medium"
     status: str = "success"
 
 
@@ -209,6 +208,9 @@ class PredictionRecord(BaseModel):
     question_type: str = QuestionType.BINARY.value
     domain: str = ""
     horizon_days: int | None = None
+    close_date: str = ""
+    tags: list[str] = Field(default_factory=list)
+    pipeline_warnings: list[str] = Field(default_factory=list)
     created_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

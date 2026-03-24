@@ -39,6 +39,7 @@ class CalibrationConfig:
     prior_hedging_shift: float = 0.04  # shift away from 50% before Platt data exists
     platt_refit_interval: int = 50  # refit every N resolved predictions
     min_resolved_for_platt: int = 50
+    min_resolved_for_isotonic: int = 20
 
 
 @dataclass

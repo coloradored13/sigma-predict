@@ -8,30 +8,60 @@ Usage:
 from __future__ import annotations
 
 import logging
-import math
 import sys
 
 import click
 
 from src.config import Config
-from src.models import Resolution
+from src.models import PredictionRecord, Resolution
 from src.platforms.metaculus import MetaculusClient
 from src.registry.store import RegistryStore
 from src.registry.query import RegistryQuery
+from src.scoring import brier_score, log_score
 
 
-def brier_score(predicted: float, actual: float) -> float:
-    """Compute Brier score: (predicted - actual)^2."""
-    return (predicted - actual) ** 2
+def classify_error(record: PredictionRecord, outcome: float) -> list[str]:
+    """Classify prediction errors into diagnostic categories.
 
+    Returns a list of zero or more error class strings:
+      CONFABULATION       — base rate strongly disagrees with outcome + low search quality
+      PROCESS             — parse failures present in any run
+      CALIBRATION_FAILURE — high Brier score and large drift from base rate
+      SEARCH_BLINDSPOT    — very low search quality scores
+      ACTOR_MISCLASSIFICATION — L2/L3 actors present but outcome contradicts calibrated prob
+    """
+    errors: list[str] = []
+    cal_prob = record.calibration.calibrated_probability
+    base_rate = record.decomposition.base_rate
 
-def log_score(predicted: float, actual: float) -> float:
-    """Compute log score: -log(predicted) if actual=1, -log(1-predicted) if actual=0."""
-    p = max(0.001, min(0.999, predicted))
-    if actual >= 0.5:
-        return -math.log(p)
-    else:
-        return -math.log(1.0 - p)
+    # CONFABULATION: base rate strongly disagrees with outcome AND search quality low
+    if abs(base_rate - outcome) > 0.5 and any(
+        r.confidence_self_score < 3 for r in record.runs
+    ):
+        errors.append("CONFABULATION")
+
+    # PROCESS: parse failures present
+    if any(getattr(r, "parse_failed", False) for r in record.runs):
+        errors.append("PROCESS")
+
+    # CALIBRATION_FAILURE: high Brier AND large delta from base rate
+    brier = (cal_prob - outcome) ** 2
+    if brier > 0.25 and abs(cal_prob - base_rate) > 0.4:
+        errors.append("CALIBRATION_FAILURE")
+
+    # SEARCH_BLINDSPOT: very low search quality scores
+    if any(getattr(r, "search_quality_score", 5) < 2 for r in record.runs):
+        errors.append("SEARCH_BLINDSPOT")
+
+    # ACTOR_MISCLASSIFICATION: L2/L3 actors present but outcome contradicts calibrated prob
+    if (
+        record.decomposition.actor_analysis
+        and record.decomposition.actor_analysis.level_2_3_present
+    ):
+        if abs(cal_prob - outcome) > 0.3:
+            errors.append("ACTOR_MISCLASSIFICATION")
+
+    return errors
 
 
 @click.command()
@@ -77,6 +107,7 @@ def main(check_all: bool, prediction_id: str | None, verbose: bool):
         if outcome is not None:
             resolution.brier_score = round(brier_score(submitted_p, outcome), 6)
             resolution.log_score = round(log_score(submitted_p, outcome), 6)
+            resolution.error_class_auto = classify_error(record, outcome)
 
         record.resolution = resolution
         store.update(record)

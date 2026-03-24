@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import uuid
 
@@ -21,34 +20,9 @@ from src.models import (
     RunResult,
     SearchPersona,
 )
+from src.pipeline.utils import _extract_json, _load_prompt
 
 logger = logging.getLogger(__name__)
-
-
-def _load_prompt(config: Config, filename: str) -> str:
-    path = os.path.join(config.prompts_dir, filename)
-    with open(path) as f:
-        return f.read()
-
-
-def _extract_json(text: str) -> str:
-    """Extract JSON from text that may contain markdown code blocks."""
-    if "```json" in text:
-        start = text.index("```json") + 7
-        end = text.index("```", start)
-        return text[start:end].strip()
-    if "```" in text:
-        start = text.index("```") + 3
-        end = text.index("```", start)
-        return text[start:end].strip()
-    text = text.strip()
-    if text.startswith("{"):
-        return text
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        return text[start:end + 1]
-    return text
 
 
 def _format_search_results(search_results: list) -> str:
@@ -195,26 +169,36 @@ Produce your forecast now. Start from the base rate of {base_rate:.3f} and adjus
 
     # Parse forecast result
     json_str = _extract_json(result)
+    parse_failed = False
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError:
         logger.warning("Failed to parse forecast JSON from %s, using base rate", model)
         logger.debug("Raw response: %s", result)
         data = {}
+        parse_failed = True
 
     probability = float(data.get("probability", base_rate))
     probability = max(0.01, min(0.99, probability))
     inside_view_adj = probability - base_rate
 
     # Pre-mortem step
-    pre_mortem_user = f"""## Original Forecast
-**Question:** {question.title}
-**Your probability estimate:** {probability:.3f}
-**Your reasoning:** {data.get('reasoning_chain', 'Not provided')}
+    # Contamination control: strip probability + reasoning so the pre-mortem
+    # cannot anchor on the original estimate. Keep only question structure and
+    # actor context to produce uncontaminated failure scenarios.
+    pre_mortem_user = f"""This prediction FAILED. What went wrong?
+
+## Question
+**Title:** {question.title}
+**Resolution Criteria:** {question.resolution_criteria}
+
+## Sub-Questions
+{chr(10).join(f'- {sq}' for sq in decomposition.sub_questions)}
 
 {_format_actor_analysis(decomposition)}
 
-Now run your pre-mortem analysis. Imagine your prediction was WRONG.
+Produce your pre-mortem analysis as JSON. Include a "falsification_anchors" key:
+a list of specific, observable conditions that would have falsified the prediction.
 """
 
     pm_result, pm_in, pm_out = router.call(
@@ -243,6 +227,7 @@ Now run your pre-mortem analysis. Imagine your prediction was WRONG.
     run_result = RunResult(
         run_id=str(uuid.uuid4()),
         model=model,
+        provider=prov,
         search_persona=persona.value,
         search_queries=data.get("search_queries_used", []),
         sources_cited=data.get("sources_cited", []),
@@ -257,6 +242,8 @@ Now run your pre-mortem analysis. Imagine your prediction was WRONG.
         probability=probability,
         confidence_self_score=int(data.get("confidence_self_score", 5)),
         reasoning_chain=data.get("reasoning_chain", ""),
+        parse_failed=parse_failed,
+        falsification_anchors=pm_data.get("falsification_anchors", []),
     )
 
     cost = CostTracking(
