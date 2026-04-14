@@ -24,11 +24,13 @@ def estimate_base_rate(
     config: Config,
     router=None,
     warnings_out: list[str] | None = None,
-) -> tuple[float, str, str]:
+) -> tuple[float, str, str, int | None]:
     """Estimate the base rate for a question in isolation.
 
     Returns:
-        tuple of (base_rate, reference_class, source)
+        tuple of (base_rate, reference_class, source, instance_count)
+        instance_count: estimated number of historical instances in the reference class,
+            or None if the LLM did not provide one.
     """
     if router is None:
         from src.pipeline.llm_router import LLMRouter
@@ -64,22 +66,24 @@ Do NOT consider current events, recent news, or inside-view evidence.
         base_rate = float(data.get("base_rate", 0.5))
         ref_class = data.get("reference_class", reference_class)
         source = data.get("base_rate_source", "LLM estimate")
+        raw_count = data.get("reference_class_instance_count")
+        instance_count: int | None = int(raw_count) if raw_count is not None else None
 
         # Clamp to valid range
         base_rate = max(0.01, min(0.99, base_rate))
 
         logger.info(
-            "Base rate locked: %.2f (reference class: %s)",
-            base_rate, ref_class,
+            "Base rate locked: %.2f (reference class: %s, instances: %s)",
+            base_rate, ref_class, instance_count,
         )
-        return base_rate, ref_class, source
+        return base_rate, ref_class, source, instance_count
 
     except (json.JSONDecodeError, ValueError):
         logger.warning("Failed to parse base rate response, defaulting to 0.5")
         logger.debug("Raw response: %s", raw)
         if warnings_out is not None:
             warnings_out.append("base_rate_parse_failure")
-        return 0.5, reference_class, "parse_failure_default"
+        return 0.5, reference_class, "parse_failure_default", None
 
 
 def search_augmented_base_rate(
@@ -93,7 +97,8 @@ def search_augmented_base_rate(
 
     Contamination controls:
     1. Restricted query: "{reference_class} historical frequency statistics" ONLY
-    2. Temporal firewall: exclude results <6 months old (client-side date check)
+    2. Note: temporal firewall is not currently active — SearchResult has no
+       published_date field. All search results pass through regardless of recency.
     3. Separate model call: only numerical rate + citation fed in (no inside-view context)
     4. Output labeled: STATISTICAL REFERENCE DATA
 

@@ -156,6 +156,16 @@ def present_for_review(
     # Verification summary
     _display_verification_summary(record)
 
+    # Falsification anchors from pre-mortem runs
+    all_anchors: list[str] = []
+    for run in record.runs:
+        all_anchors.extend(run.falsification_anchors)
+    if all_anchors:
+        console.print()
+        console.print("[bold magenta]Falsification Anchors:[/bold magenta]")
+        for anchor in all_anchors:
+            console.print(f"  - {anchor}")
+
     # Flags
     flags = _generate_flags(record, question)
     if flags:
@@ -302,6 +312,13 @@ def _display_verification_summary(record: PredictionRecord) -> None:
 def _generate_flags(record: PredictionRecord, question: PlatformQuestion) -> list[str]:
     """Generate review flags based on prediction characteristics."""
     flags = []
+
+    # Falsification anchors from pre-mortem
+    all_anchors: list[str] = []
+    for run in record.runs:
+        all_anchors.extend(run.falsification_anchors)
+    if all_anchors:
+        flags.append(f"Falsification anchors: {'; '.join(all_anchors)}")
 
     # High uncertainty
     if record.aggregation.stdev > 0.15:

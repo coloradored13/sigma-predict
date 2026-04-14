@@ -8,10 +8,29 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import numpy as np
 
 from src.models import Aggregation, RunResult
+
+# Domains exempt from clustering warnings — authoritative sources that
+# legitimately appear across many independent searches.
+_AUTHORITATIVE_DOMAINS = frozenset({
+    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk",
+    "nytimes.com", "wsj.com", "ft.com", "economist.com",
+    "who.int", "cdc.gov", "bls.gov", "census.gov", "nih.gov", "nasa.gov",
+    "data.worldbank.org", "fred.stlouisfed.org", "imf.org", "oecd.org",
+    "europa.eu", "un.org",
+    "wikipedia.org", "metaculus.com", "polymarket.com",
+})
+
+# Two-part TLD suffixes that require three hostname parts for the apex domain.
+# Without this, "bbc.co.uk" would incorrectly return "co.uk" as the apex.
+_TWO_PART_TLDS = frozenset({
+    "co.uk", "com.au", "co.jp", "co.kr", "com.br",
+    "co.in", "co.nz", "org.uk", "ac.uk",
+})
 
 
 def aggregate_runs(
@@ -98,12 +117,16 @@ def aggregate_runs(
     # Estimate via the ratio of mean variance to individual variances
     effective_n = _estimate_effective_n(probabilities)
 
+    clustering_score, clustered_domains = source_cluster_check(runs)
+
     return Aggregation(
         method=method,
         raw_aggregate=raw_aggregate,
         stdev=round(stdev, 4),
         inter_model_agreement=round(inter_model_agreement, 4),
         effective_n=effective_n,
+        sources_clustering_score=round(clustering_score, 4),
+        clustered_domains=clustered_domains,
     )
 
 
@@ -155,6 +178,64 @@ def _estimate_effective_n(probabilities: np.ndarray) -> int:
         effective_n = 1
 
     return max(1, min(n, effective_n))
+
+
+def source_cluster_check(runs: list[RunResult]) -> tuple[float, list[str]]:
+    """Detect apex-domain clustering across forecast runs.
+
+    Recency bias or filter bubble risk: when N/N runs cite the same news source,
+    the aggregate probability estimate has reduced independence value.
+
+    Returns:
+        (clustering_score, clustered_domains)
+        clustering_score: 0.0 = no clustering, 1.0 = all runs cite same apex domain
+        clustered_domains: apex domains appearing in >=50% of runs (non-authoritative only)
+    """
+    if len(runs) < 2:
+        return 0.0, []
+
+    def apex_domain(url: str) -> str:
+        try:
+            host = urlparse(url).netloc.lower()
+            parts = host.split(".")
+            if len(parts) >= 3 and ".".join(parts[-2:]) in _TWO_PART_TLDS:
+                return ".".join(parts[-3:])
+            return ".".join(parts[-2:]) if len(parts) >= 2 else host
+        except Exception:
+            return url
+
+    n_runs = len(runs)
+    threshold = 0.5  # domain must appear in >=50% of runs to be flagged
+
+    # Build per-run apex domain sets
+    run_domains: list[set[str]] = []
+    for run in runs:
+        domains = {apex_domain(url) for url in run.sources_cited if url}
+        run_domains.append(domains)
+
+    # Count how many runs cite each domain
+    all_domains: set[str] = set()
+    for ds in run_domains:
+        all_domains.update(ds)
+
+    domain_counts: dict[str, int] = {}
+    for domain in all_domains:
+        domain_counts[domain] = sum(1 for ds in run_domains if domain in ds)
+
+    # Identify non-authoritative domains cited by >= threshold of runs
+    clustered = [
+        d for d, count in domain_counts.items()
+        if count / n_runs >= threshold and d not in _AUTHORITATIVE_DOMAINS
+    ]
+
+    if not clustered:
+        return 0.0, []
+
+    # Score = fraction of runs sharing the most-clustered domain
+    max_count = max(domain_counts[d] for d in clustered)
+    score = max_count / n_runs
+
+    return score, sorted(clustered)
 
 
 def get_aggregate_run(runs: list[RunResult], aggregation: Aggregation) -> RunResult:

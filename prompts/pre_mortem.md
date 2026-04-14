@@ -8,13 +8,14 @@ This is not a second opinion on the question. This is a systematic bias check on
 
 You will receive:
 - **question_text**: The forecasting question.
-- **current_estimate**: The probability estimate to stress-test (0-1).
 - **base_rate_used**: The base rate that anchored the estimate.
-- **inside_view_adjustment**: The adjustment from base rate to current estimate.
+- **inside_view_adjustment**: The adjustment from base rate to the estimate.
 - **adjustment_reasoning**: Why the adjustment was made.
 - **reasoning_chain**: The full reasoning that produced the estimate.
 - **actor_analysis**: Actor motivations and classifications (may be empty).
 - **search_results_summary**: Brief summary of evidence gathered.
+
+You do NOT receive the original probability estimate. This is intentional contamination control — your failure analysis must be independent of the forecasted probability.
 
 ## Your Tasks
 

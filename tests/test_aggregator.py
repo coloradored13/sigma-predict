@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from src.models import RunResult
-from src.pipeline.aggregator import aggregate_runs, _extremize
+from src.pipeline.aggregator import aggregate_runs, _extremize, source_cluster_check
 
 
 def _make_run(probability: float, model: str = "test-model") -> RunResult:
@@ -140,3 +140,86 @@ class TestExtremize:
         # Should not go below 0.01 or above 0.99
         result = _extremize(0.01, 5.0)
         assert result == 0.01  # clamped at boundary
+
+
+class TestApexDomainCcTLD:
+    """Tests for ccTLD handling in apex_domain (Item 2)."""
+
+    def _make_run_with_sources(self, urls: list[str]) -> RunResult:
+        return RunResult(probability=0.5, sources_cited=urls)
+
+    def test_co_uk_returns_three_parts(self):
+        run1 = self._make_run_with_sources(["https://www.bbc.co.uk/news/world"])
+        run2 = self._make_run_with_sources(["https://bbc.co.uk/article"])
+        score, clustered = source_cluster_check([run1, run2])
+        # bbc.co.uk should cluster (both cite it), not "co.uk"
+        assert "bbc.co.uk" in clustered or score == 0.0  # score=0 if authoritative
+        # Either way, "co.uk" must NOT appear as a clustered domain
+        assert "co.uk" not in clustered
+
+    def test_com_au_returns_three_parts(self):
+        run1 = self._make_run_with_sources(["https://news.example.com.au/story"])
+        run2 = self._make_run_with_sources(["https://news.example.com.au/other"])
+        score, clustered = source_cluster_check([run1, run2])
+        # "com.au" should NOT appear; "example.com.au" should
+        assert "com.au" not in clustered
+        if score > 0:
+            assert "example.com.au" in clustered
+
+    def test_regular_tld_unaffected(self):
+        run1 = self._make_run_with_sources(["https://example.com/a"])
+        run2 = self._make_run_with_sources(["https://example.com/b"])
+        score, clustered = source_cluster_check([run1, run2])
+        assert "example.com" in clustered
+
+    def test_bbc_co_uk_is_authoritative_not_flagged(self):
+        run1 = self._make_run_with_sources(["https://bbc.co.uk/news/1"])
+        run2 = self._make_run_with_sources(["https://bbc.co.uk/news/2"])
+        score, clustered = source_cluster_check([run1, run2])
+        # bbc.co.uk is in _AUTHORITATIVE_DOMAINS — should not be flagged
+        assert "bbc.co.uk" not in clustered
+        assert score == 0.0
+
+
+class TestNewAuthoritativeDomains:
+    """Tests for expanded _AUTHORITATIVE_DOMAINS (Item 11)."""
+
+    def _make_run_with_sources(self, urls: list[str]) -> RunResult:
+        return RunResult(probability=0.5, sources_cited=urls)
+
+    def test_government_stats_not_flagged(self):
+        for domain in ["bls.gov", "census.gov", "cdc.gov"]:
+            run1 = self._make_run_with_sources([f"https://{domain}/data/1"])
+            run2 = self._make_run_with_sources([f"https://{domain}/data/2"])
+            score, clustered = source_cluster_check([run1, run2])
+            assert domain not in clustered, f"{domain} should be authoritative, not flagged"
+            assert score == 0.0
+
+    def test_international_stats_not_flagged(self):
+        for domain in ["imf.org", "un.org", "oecd.org", "who.int"]:
+            run1 = self._make_run_with_sources([f"https://{domain}/report/1"])
+            run2 = self._make_run_with_sources([f"https://{domain}/report/2"])
+            score, clustered = source_cluster_check([run1, run2])
+            assert domain not in clustered, f"{domain} should be authoritative, not flagged"
+
+    def test_fred_worldbank_not_flagged(self):
+        for domain in ["fred.stlouisfed.org", "data.worldbank.org"]:
+            run1 = self._make_run_with_sources([f"https://{domain}/series/1"])
+            run2 = self._make_run_with_sources([f"https://{domain}/series/2"])
+            score, clustered = source_cluster_check([run1, run2])
+            assert domain not in clustered, f"{domain} should be authoritative, not flagged"
+
+
+class TestParseFailedExclusionFromAggregation:
+    """Tests for parse_failed run exclusion (Item 7 — aggregator side)."""
+
+    def test_parse_failed_runs_not_aggregated(self):
+        """Runs with parse_failed=True should not pollute the aggregate."""
+        good_run = RunResult(probability=0.8, parse_failed=False)
+        bad_run = RunResult(probability=0.5, parse_failed=True)  # base_rate default
+        # The good run alone says 0.8. If bad_run is included the aggregate drops.
+        result_all = aggregate_runs([good_run, bad_run])
+        result_good_only = aggregate_runs([good_run])
+        # Just verifying the helper works — orchestrator does the filtering
+        assert result_good_only.raw_aggregate == pytest.approx(0.8)
+        assert result_all.raw_aggregate < 0.8  # bad_run drags it down

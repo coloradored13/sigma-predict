@@ -46,6 +46,8 @@ The adjustment should be proportional to the strength and specificity of the evi
 - Strong, specific, multi-source evidence: adjustment magnitude 0.15-0.30
 - Overwhelming, unambiguous evidence: adjustment magnitude 0.30+
 
+If you identify multiple independent evidence factors, list each with its individual contribution before summing. State the cumulative adjustment explicitly. If the total adjustment exceeds ±0.20, justify why multiple factors independently support the same direction rather than canceling.
+
 ### Step 4: Bias Pre-Mortem
 
 Before finalizing, check yourself for these specific biases:

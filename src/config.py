@@ -96,6 +96,22 @@ class Config:
             if self.google_ai_api_key:
                 self.models.append(ModelConfig(provider="google", model_id="gemini-3.1"))
 
+    # Verification providers — names from sigma-verify PROVIDERS registry.
+    # Controls which external providers LLMRouter activates for verification/challenge.
+    # 4B local models (nemotron-nano, qwen-local) excluded by default: unreliable JSON.
+    verification_providers: list[str] = field(default_factory=lambda: [
+        "openai", "google", "llama", "gemma", "nemotron",
+        "deepseek", "qwen", "devstral", "glm", "kimi",
+    ])
+
+    # Audit logging — set to a file path to enable per-call LLM audit log.
+    # None = disabled (no performance impact). Logs are JSON-L format.
+    audit_path: str | None = None
+
+    # Strict validation — when True, validation gates raise PipelineError
+    # instead of appending to pipeline_warnings. Default: False (warn only).
+    strict_validation: bool = False
+
     # Search
     search: SearchConfig = field(default_factory=SearchConfig)
 

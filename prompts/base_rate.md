@@ -54,16 +54,19 @@ If you are reasoning by analogy rather than from direct data, say so explicitly.
 
 ## Output Format
 
-Return a single JSON object with exactly these three fields:
+Return a single JSON object with exactly these four fields:
 
 ```json
 {
   "reference_class": "The specific reference class used, with time bounds",
   "base_rate": 0.35,
-  "base_rate_source": "Detailed source/reasoning for the base rate estimate. Include counts if available (N successes out of M total). State explicitly if this is from published data, enumerable cases, or calibrated reasoning from analogous classes."
+  "base_rate_source": "Detailed source/reasoning for the base rate estimate. Include counts if available (N successes out of M total). State explicitly if this is from published data, enumerable cases, or calibrated reasoning from analogous classes.",
+  "reference_class_instance_count": 47
 }
 ```
 
 The `base_rate` must be a float between 0.01 and 0.99. Never output exactly 0 or 1.
+
+The `reference_class_instance_count` is the estimated total number of historical instances in the reference class (not just successes). If you cannot estimate the count, set it to null. Reference classes with fewer than 20 instances have unreliable base rates (±30pp 95% CI); fewer than 10 instances is very unreliable.
 
 Return ONLY the JSON object. No commentary before or after.

@@ -85,6 +85,7 @@ class Decomposition(BaseModel):
     reference_class: str = ""
     base_rate: float = 0.5
     base_rate_source: str = ""
+    reference_class_instance_count: int | None = None
     actor_analysis: ActorAnalysis = Field(default_factory=ActorAnalysis)
 
 
@@ -118,6 +119,8 @@ class Aggregation(BaseModel):
     effective_n: int = 1
     deliberation_triggered: bool = False
     deliberation_result: dict | None = None
+    sources_clustering_score: float = 0.0   # 0.0=no clustering, 1.0=all runs cite same apex domain
+    clustered_domains: list[str] = Field(default_factory=list)  # apex domains with cross-run clustering
 
 
 class CalibrationData(BaseModel):

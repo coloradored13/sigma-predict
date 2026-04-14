@@ -41,6 +41,7 @@ from src.pipeline.deliberation import deliberate, should_deliberate
 from src.pipeline.forecaster import run_forecast
 from src.pipeline.llm_router import LLMRouter
 from src.pipeline.search import SearchModule
+from src.pipeline.validator import PipelineValidator
 from src.pipeline.verification import (
     challenge_forecast,
     should_verify_run,
@@ -64,6 +65,7 @@ class Orchestrator:
         self.router = LLMRouter(config)
         self.store = RegistryStore(config.registry_path)
         self.query = RegistryQuery(self.store)
+        self.validator = PipelineValidator(config)
 
     def predict_until_review(
         self,
@@ -157,7 +159,7 @@ class Orchestrator:
         # Step 2: Estimate base rate (isolated — BEFORE search)
         logger.info("Step 2/7: Estimating base rate (isolated)...")
         _progress("Step 2/7: Estimating base rate...")
-        base_rate, ref_class, base_source = estimate_base_rate(
+        base_rate, ref_class, base_source, instance_count = estimate_base_rate(
             question_text=question_text_full,
             sub_questions=decomposition.sub_questions,
             reference_class=decomposition.reference_class,
@@ -167,6 +169,7 @@ class Orchestrator:
         record.decomposition.base_rate = base_rate
         record.decomposition.reference_class = ref_class
         record.decomposition.base_rate_source = base_source
+        record.decomposition.reference_class_instance_count = instance_count
 
         # Step 2c: Search-augmented base rate (statistical firewall — AFTER isolated estimate)
         search_module_for_base = SearchModule(self.config)
@@ -191,6 +194,10 @@ class Orchestrator:
                 self.router, self.config,
             )
             record.verification.stages.append(br_sv)
+
+        # Validate base rate before forecasting
+        for warning in self.validator.validate_base_rate(record):
+            record.pipeline_warnings.append(warning)
 
         # Step 3: Run forecaster(s)
         logger.info("Step 3/7: Running %d forecast run(s)...", num_runs)
@@ -233,19 +240,57 @@ class Orchestrator:
                     )
                     record.verification.stages.append(run_sv)
 
+        # Validate runs (parse failures, count, search quality) before aggregation
+        for warning in self.validator.validate_runs(record, requested_runs=num_runs):
+            record.pipeline_warnings.append(warning)
+
         # Step 4: Aggregate (before challenge so challenge targets the aggregate)
         logger.info("Step 4/7: Aggregating estimates...")
         _progress("Step 4/7: Aggregating estimates...")
-        n_providers = len(set(r.provider for r in record.runs if hasattr(r, "provider")))
+
+        # Exclude parse_failed runs — they default to base_rate and anchor the aggregate
+        valid_runs = [r for r in record.runs if not r.parse_failed]
+        n_valid = len(valid_runs)
+        n_total = len(record.runs)
+        if n_valid < n_total:
+            if n_valid == 0:
+                msg = (
+                    f"parse_failure_exclusion: all {n_total} run(s) had parse_failed=True "
+                    f"— falling back to all runs for aggregation"
+                )
+                record.pipeline_warnings.append(msg)
+                logger.warning(msg)
+                valid_runs = record.runs
+            else:
+                msg = (
+                    f"parse_failure_exclusion: {n_total - n_valid} run(s) excluded from "
+                    f"aggregation (parse failures) — {n_valid} valid run(s) used"
+                )
+                if n_valid < 2:
+                    msg += f" — only {n_valid} valid run (parse failures excluded)"
+                record.pipeline_warnings.append(msg)
+                logger.warning(msg)
+
+        n_providers = len(set(r.provider for r in valid_runs if hasattr(r, "provider")))
         n_distinct_providers = max(1, n_providers)
         aggregation = aggregate_runs(
-            record.runs,
+            valid_runs,
             method=self.config.aggregation.method,
             trim_fraction=self.config.aggregation.trim_fraction,
             extremization_factor=self.config.aggregation.extremization_factor,
             n_distinct_providers=n_distinct_providers,
         )
         record.aggregation = aggregation
+
+        # Log source clustering warning if detected
+        if aggregation.sources_clustering_score >= 0.5 and aggregation.clustered_domains:
+            msg = (
+                f"source_clustering_gate: {len(aggregation.clustered_domains)} domain(s) "
+                f"cited by >={int(aggregation.sources_clustering_score * 100)}% of runs "
+                f"— {', '.join(aggregation.clustered_domains[:3])}"
+            )
+            record.pipeline_warnings.append(msg)
+            logger.warning(msg)
 
         # Step 3c: Challenge forecast via pre-mortem if enabled
         challenge_entry_for_deliberation = None
@@ -309,12 +354,19 @@ class Orchestrator:
             confidence_interval=[round(ci_low, 4), round(ci_high, 4)],
         )
 
+        # Validate calibrated probability
+        for warning in self.validator.validate_aggregation(record):
+            record.pipeline_warnings.append(warning)
+
         # Collect platform signals
         record.platform_signals = self._collect_platform_signals(question, platform_client)
 
         # Record cost (latency through pipeline, not including review/submit)
         total_cost.latency_seconds = time.time() - pipeline_start
         record.cost = total_cost
+
+        # Flush audit log if enabled
+        self.router.flush_audit()
 
         logger.info(
             "Pipeline complete (pre-review): id=%s prob=%.3f cost=$%.4f",

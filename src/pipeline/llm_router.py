@@ -1,26 +1,38 @@
 """Unified LLM routing layer.
 
-Dispatches calls to Anthropic (local client), OpenAI, and Gemini
-(via sigma-verify). Provides cross-model verification and challenge
-capabilities through external providers only.
+Dispatches calls to Anthropic (local client), and all sigma-verify providers
+(OpenAI, Gemini, and 10 Ollama-backed models). Provides cross-model
+verification and challenge capabilities through external providers only.
+
+Provider roles:
+- Local AnthropicClient: primary forecasting calls only (host model).
+  Not used for self-verification — Anthropic is the host model.
+- sigma-verify PROVIDERS: external verification/challenge. When Anthropic
+  is primary, all sigma-verify providers are used for verification.
+  When another provider is primary, Anthropic (via sigma-verify) can join the
+  verification pool if added to Config.verification_providers.
+- 4B local models (nemotron-nano, qwen-local): verification only.
+  Unreliable for structured JSON forecaster output.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from src.config import Config
+from src.pipeline.llm_audit import LLMAuditLogger
 
 logger = logging.getLogger(__name__)
 
 
 class AnthropicClient:
-    """Local Anthropic client matching sigma-verify's call() pattern.
+    """Local Anthropic client for primary forecasting calls.
 
     Does NOT have verify()/challenge() — Anthropic is the host model,
-    not a verification target.
+    not a verification target when used as primary.
     """
 
     def __init__(self, model: str | None = None, api_key: str | None = None):
@@ -61,54 +73,117 @@ class AnthropicClient:
 class LLMRouter:
     """Unified dispatcher for all LLM calls.
 
-    Creates AnthropicClient locally and imports OpenAIClient/GeminiClient
-    from sigma-verify. Routes call(), verify(), challenge(), and
-    cross_verify() to the appropriate client.
+    Creates AnthropicClient locally for primary forecasting and loads all
+    sigma-verify PROVIDERS for external verification. Routes call(),
+    verify(), challenge(), and cross_verify() to the appropriate client.
+
+    Client cache: clients are keyed by (provider, model_id). No model
+    mutation occurs — each (provider, model) pair gets its own instance.
+    Add a threading.Lock around _client_cache access if concurrent calls
+    are introduced.
     """
 
     def __init__(self, config: Config):
         self.config = config
 
-        # Local Anthropic client (only if key available)
+        # Audit logger — None when config.audit_path is not set (zero overhead)
+        self._audit: LLMAuditLogger | None = (
+            LLMAuditLogger(config.audit_path) if config.audit_path else None
+        )
+
+        # Local Anthropic client for primary forecasting (host model)
         self._anthropic = None
         if config.anthropic_api_key:
             self._anthropic = AnthropicClient(
                 model="claude-sonnet-4-6",
                 api_key=config.anthropic_api_key,
             )
-            logger.info("Anthropic client available")
+            logger.info("Anthropic client available (primary/host)")
 
-        # External clients from sigma-verify
-        self._openai = None
-        self._gemini = None
+        # Cache: (provider_name, model_id) -> client instance
+        # Eliminates model-mutation tech debt — each call uses its own instance
+        self._client_cache: dict[tuple[str, str], Any] = {}
 
-        try:
-            from sigma_verify import OpenAIClient
-            client = OpenAIClient()
-            if client.available:
-                self._openai = client
-                logger.info("OpenAI client available: model=%s", client.model)
-            else:
-                logger.info("OpenAI client not available (no API key)")
-        except ImportError:
-            logger.warning("sigma-verify not installed — OpenAI client unavailable")
-
-        try:
-            from sigma_verify import GeminiClient
-            client = GeminiClient()
-            if client.available:
-                self._gemini = client
-                logger.info("Gemini client available: model=%s", client.model)
-            else:
-                logger.info("Gemini client not available (no API key)")
-        except ImportError:
-            logger.warning("sigma-verify not installed — Gemini client unavailable")
+        # External providers from sigma-verify PROVIDERS registry
+        # verification_providers config controls which are active
+        self._external_providers: dict[str, Any] = {}
+        self._init_external_providers(config)
 
         logger.info(
-            "LLMRouter ready: primary=%s, providers=%s",
+            "LLMRouter ready: primary=%s, external_providers=%s",
             config.primary_model.provider if config.primary_model else "none",
-            self.available_providers(),
+            list(self._external_providers.keys()),
         )
+
+    def _init_external_providers(self, config: Config) -> None:
+        """Load external providers from sigma-verify PROVIDERS registry."""
+        try:
+            from sigma_verify import PROVIDERS
+        except ImportError:
+            logger.warning("sigma-verify not installed — no external providers available")
+            return
+
+        allowed = set(config.verification_providers)
+
+        for name, cls in PROVIDERS.items():
+            if name == "anthropic":
+                # sigma-verify's AnthropicClient: only add when Anthropic is NOT primary
+                # (avoids self-verification when Anthropic is the host model)
+                if config.primary_model and config.primary_model.provider != "anthropic":
+                    try:
+                        client = cls()
+                        if client.available and name in allowed:
+                            self._external_providers[name] = client
+                            logger.info("External provider available: %s model=%s", name, client.model)
+                    except Exception as e:
+                        logger.debug("Provider %s init failed: %s", name, e)
+                continue
+
+            if name not in allowed:
+                continue
+
+            try:
+                client = cls()
+                if client.available:
+                    self._external_providers[name] = client
+                    logger.info("External provider available: %s model=%s", name, client.model)
+                else:
+                    logger.debug("Provider %s not available (no API key/env)", name)
+            except Exception as e:
+                logger.debug("Provider %s init failed: %s", name, e)
+
+        # Legacy: keep _openai and _gemini attributes for backward compatibility
+        self._openai = self._external_providers.get("openai")
+        self._gemini = self._external_providers.get("google")
+
+    def _get_or_create_client(self, provider: str, model: str) -> Any:
+        """Get a cached client for (provider, model), creating if needed.
+
+        No model mutation: each (provider, model) pair has its own instance.
+        """
+        key = (provider, model)
+        if key in self._client_cache:
+            return self._client_cache[key]
+
+        if provider == "anthropic":
+            client = AnthropicClient(
+                model=model,
+                api_key=self.config.anthropic_api_key,
+            )
+        else:
+            try:
+                from sigma_verify import PROVIDERS
+            except ImportError:
+                raise ValueError("sigma-verify not installed")
+
+            cls = PROVIDERS.get(provider)
+            if cls is None:
+                raise ValueError(f"Unknown provider: {provider}")
+
+            client = cls(model=model)
+
+        self._client_cache[key] = client
+        return client
 
     def call(
         self,
@@ -122,34 +197,34 @@ class LLMRouter:
         """Dispatch an LLM call to the right client.
 
         Returns (response_text, tokens_in, tokens_out).
+        No model mutation: uses per-(provider, model) cached client.
         """
+        t0 = time.monotonic()
         if provider == "anthropic":
             if self._anthropic is None:
                 raise ValueError("Anthropic client not available (no API key)")
-            return self._anthropic.call(system, user, temperature, max_tokens, model=model)
-
-        elif provider == "openai":
-            if self._openai is None:
-                raise ValueError("OpenAI client not available")
-            old_model = self._openai.model
-            self._openai.model = model
-            try:
-                return self._openai.call(system, user, temperature, max_tokens)
-            finally:
-                self._openai.model = old_model
-
-        elif provider == "google":
-            if self._gemini is None:
-                raise ValueError("Gemini client not available")
-            old_model = self._gemini.model
-            self._gemini.model = model
-            try:
-                return self._gemini.call(system, user, temperature, max_tokens)
-            finally:
-                self._gemini.model = old_model
-
+            text, tokens_in, tokens_out = self._anthropic.call(system, user, temperature, max_tokens, model=model)
         else:
-            raise ValueError(f"Unknown provider: {provider}")
+            # For non-anthropic providers, use cache to avoid model mutation
+            client = self._get_or_create_client(provider, model)
+            text, tokens_in, tokens_out = client.call(system, user, temperature, max_tokens)
+
+        if self._audit is not None:
+            duration_ms = (time.monotonic() - t0) * 1000
+            cost = self.estimate_cost(provider, model, tokens_in, tokens_out)
+            self._audit.log_call(
+                provider=provider,
+                model=model,
+                method="call",
+                params={"system": system, "user": user, "temperature": temperature, "max_tokens": max_tokens},
+                result_text=text,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                duration_ms=duration_ms,
+                cost_usd=cost,
+            )
+
+        return text, tokens_in, tokens_out
 
     def verify(
         self,
@@ -160,15 +235,31 @@ class LLMRouter:
         """Route verification to an external client.
 
         Returns VerificationResult on success, None on failure.
-        External clients only (OpenAI/Gemini — Anthropic is the host model).
+        External clients only (Anthropic is the host model).
         """
         client = self._get_external_client(provider)
         if client is None:
             logger.debug("No external client available for verification")
             return None
 
+        t0 = time.monotonic()
         try:
-            return client.verify(finding, context)
+            result = client.verify(finding, context)
+            if self._audit is not None:
+                duration_ms = (time.monotonic() - t0) * 1000
+                provider_name = self._provider_name(client)
+                result_text = str(result) if result is not None else ""
+                self._audit.log_call(
+                    provider=provider_name,
+                    model=client.model,
+                    method="verify",
+                    params={"finding": finding, "context": context},
+                    result_text=result_text,
+                    tokens_in=0,
+                    tokens_out=0,
+                    duration_ms=duration_ms,
+                )
+            return result
         except Exception as e:
             logger.warning("Verification failed (%s): %s", type(e).__name__, e)
             try:
@@ -201,9 +292,23 @@ class LLMRouter:
             logger.debug("No external client available for challenge")
             return None
 
+        t0 = time.monotonic()
         try:
             result = client.challenge(claim, evidence)
             result["status"] = "success"
+            if self._audit is not None:
+                duration_ms = (time.monotonic() - t0) * 1000
+                provider_name = self._provider_name(client)
+                self._audit.log_call(
+                    provider=provider_name,
+                    model=client.model,
+                    method="challenge",
+                    params={"claim": claim, "evidence": evidence},
+                    result_text=str(result),
+                    tokens_in=0,
+                    tokens_out=0,
+                    duration_ms=duration_ms,
+                )
             return result
         except Exception as e:
             logger.warning("Challenge failed (%s): %s", type(e).__name__, e)
@@ -225,8 +330,23 @@ class LLMRouter:
         """
         results = []
         for client in self._external_clients():
+            t0 = time.monotonic()
             try:
                 result = client.verify(finding, context)
+                if self._audit is not None:
+                    duration_ms = (time.monotonic() - t0) * 1000
+                    provider_name = self._provider_name(client)
+                    result_text = str(result) if result is not None else ""
+                    self._audit.log_call(
+                        provider=provider_name,
+                        model=client.model,
+                        method="cross_verify",
+                        params={"finding": finding, "context": context},
+                        result_text=result_text,
+                        tokens_in=0,
+                        tokens_out=0,
+                        duration_ms=duration_ms,
+                    )
                 results.append(result)
             except Exception as e:
                 logger.warning(
@@ -248,20 +368,22 @@ class LLMRouter:
                     pass
         return results
 
+    def flush_audit(self) -> None:
+        """Flush buffered audit log entries to disk."""
+        if self._audit is not None:
+            self._audit.flush()
+
     def available_providers(self) -> list[str]:
         """Return list of provider names with valid API keys."""
         providers = []
         if self._anthropic is not None and self._anthropic.available:
             providers.append("anthropic")
-        if self._openai is not None:
-            providers.append("openai")
-        if self._gemini is not None:
-            providers.append("google")
+        providers.extend(self._external_providers.keys())
         return providers
 
     def verification_available(self) -> bool:
         """Check if any external provider is available for verification."""
-        return self._openai is not None or self._gemini is not None
+        return bool(self._external_providers)
 
     def estimate_cost(
         self,
@@ -290,16 +412,11 @@ class LLMRouter:
 
     def _get_external_client(self, provider: str | None = None) -> Any | None:
         """Get an external client by provider name, or the first available."""
-        if provider == "openai":
-            return self._openai
-        if provider == "google":
-            return self._gemini
-        if provider is None:
-            # Return first available external client
-            if self._openai is not None:
-                return self._openai
-            if self._gemini is not None:
-                return self._gemini
+        if provider is not None:
+            return self._external_providers.get(provider)
+        # Return first available external client
+        if self._external_providers:
+            return next(iter(self._external_providers.values()))
         return None
 
     def _external_clients(self) -> list:
@@ -309,26 +426,21 @@ class LLMRouter:
         same model that generated the forecast.
         """
         primary = self.config.primary_model.provider if self.config.primary_model else None
-        clients = []
-        if self._openai is not None and primary != "openai":
-            clients.append(self._openai)
-        if self._gemini is not None and primary != "google":
-            clients.append(self._gemini)
+        clients = [
+            client for name, client in self._external_providers.items()
+            if name != primary
+        ]
         # If the only available providers are the primary, include them anyway
-        # (some verification is better than none)
         if not clients:
-            if self._openai is not None:
-                clients.append(self._openai)
-            if self._gemini is not None:
-                clients.append(self._gemini)
+            clients = list(self._external_providers.values())
         return clients
 
     def _provider_name(self, client: Any) -> str:
         """Get the provider name for a client instance."""
-        if client is self._openai:
-            return "openai"
-        if client is self._gemini:
-            return "google"
+        for name, c in self._external_providers.items():
+            if c is client:
+                return name
         if client is self._anthropic:
             return "anthropic"
         return "unknown"
+

@@ -125,7 +125,7 @@ def deliberate(
 
     try:
         raw, _, _ = router.call(
-            "anthropic",
+            config.primary_model.provider,
             config.primary_model.model_id,
             system_prompt,
             user_content,
